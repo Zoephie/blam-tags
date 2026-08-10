@@ -117,7 +117,7 @@ impl From<serde_json::Error> for TagSchemaError {
 // Names match the library's `Tag*` convention + a `Schema` suffix.
 //
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagSchema {
     tag: String,
     #[serde(default)] parent_tag: Option<String>,
@@ -156,13 +156,13 @@ fn index_of<V>(map: &BTreeMap<String, V>, name: &str) -> Option<u32> {
     map.keys().position(|k| k == name).map(|i| i as u32)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagBlockSchema {
     max_count: u32,
     #[serde(rename = "struct")] struct_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagStructSchema {
     guid: String,
     size: u32,
@@ -173,7 +173,7 @@ struct TagStructSchema {
     tag: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagFieldSchema {
     #[serde(rename = "type")] ty: String,
     #[serde(default)] name: Option<String>,
@@ -181,27 +181,27 @@ struct TagFieldSchema {
     #[serde(default)] group_tag: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagArraySchema {
     count: u32,
     #[serde(rename = "struct")] struct_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagEnumSchema {
     options: Vec<Option<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagDataSchema {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct PageableResourceSchema {
     flags: u64,
     #[serde(rename = "struct")] struct_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct ApiInteropSchema {
     guid: String,
     #[serde(rename = "struct")] struct_name: String,
@@ -419,7 +419,11 @@ impl TagLayout {
         // we don't silently drop it).
         merge_parent_schemas(&mut schema, defs_dir);
 
-        let layout = build_layout_from_schema(schema, defs_dir)?;
+        // Same inheritance, one level in: a struct standing in for another
+        // group's root inherits through *that* group's chain, not this one's.
+        let folded_templates = merge_template_struct_inheritance(&mut schema, defs_dir);
+
+        let layout = build_layout_from_schema(schema, defs_dir, &folded_templates)?;
         Ok((layout, meta))
     }
 }
@@ -448,30 +452,336 @@ fn merge_parent_schemas(schema: &mut TagSchema, defs_dir: &Path) {
             break;
         };
 
-        for (k, v) in parent_schema.blocks {
-            schema.blocks.entry(k).or_insert(v);
+        current_parent = parent_schema.parent_tag.clone();
+        absorb_registries(schema, parent_schema);
+    }
+}
+
+/// Fold `donor`'s registries into `schema`, child winning on collision.
+/// Shared by the two inheritance walks so they cannot drift apart.
+fn absorb_registries(schema: &mut TagSchema, donor: TagSchema) {
+    for (k, v) in donor.blocks {
+        schema.blocks.entry(k).or_insert(v);
+    }
+    for (k, v) in donor.structs {
+        schema.structs.entry(k).or_insert(v);
+    }
+    for (k, v) in donor.arrays {
+        schema.arrays.entry(k).or_insert(v);
+    }
+    for (k, v) in donor.enums_flags {
+        schema.enums_flags.entry(k).or_insert(v);
+    }
+    for (k, v) in donor.datas {
+        schema.datas.entry(k).or_insert(v);
+    }
+    for (k, v) in donor.resources {
+        schema.resources.entry(k).or_insert(v);
+    }
+    for (k, v) in donor.interops {
+        schema.interops.entry(k).or_insert(v);
+    }
+}
+
+/// Read the schema for `group_tag` out of the same definitions directory.
+fn load_sibling_schema(
+    defs_dir: &Path,
+    tag_index: &serde_json::Map<String, serde_json::Value>,
+    group_tag: &str,
+) -> Option<TagSchema> {
+    let name = tag_index.get(group_tag)?.as_str()?;
+    let bytes = std::fs::read(defs_dir.join(format!("{name}.json"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Separates a registry key from the template it was imported for. No dumped
+/// definition name contains it, and [`schema_display_name`] strips it again
+/// before the key reaches the layout's string table — so an entry imported
+/// under a distinct key still serializes under the name the kits use.
+const TEMPLATE_KEY_SUFFIX: &str = "##";
+
+/// A registry key as it should appear in the built layout.
+fn schema_display_name(key: &str) -> &str {
+    match key.find(TEMPLATE_KEY_SUFFIX) {
+        Some(at) => &key[..at],
+        None => key,
+    }
+}
+
+/// Which registry a field's `definition` names, so an entry imported under a
+/// different key can still be reached by the fields pointing at it.
+#[derive(Clone, Copy)]
+enum DefinitionRegistry {
+    Blocks,
+    Structs,
+    Arrays,
+    EnumsFlags,
+    Datas,
+    Resources,
+    Interops,
+}
+
+fn definition_registry(ty: &str) -> Option<DefinitionRegistry> {
+    Some(match ty {
+        "block" => DefinitionRegistry::Blocks,
+        "struct" => DefinitionRegistry::Structs,
+        "array" => DefinitionRegistry::Arrays,
+        "data" => DefinitionRegistry::Datas,
+        "pageable_resource" => DefinitionRegistry::Resources,
+        "api_interop" => DefinitionRegistry::Interops,
+        // Block indices and block *flags* both index the block registry;
+        // anything else ending in `_flags` is an option-name list.
+        t if t.ends_with("_block_index") || t.ends_with("_block_flags") => {
+            DefinitionRegistry::Blocks
         }
-        for (k, v) in parent_schema.structs {
-            schema.structs.entry(k).or_insert(v);
+        t if t.ends_with("_enum") || t.ends_with("_flags") => DefinitionRegistry::EnumsFlags,
+        _ => return None,
+    })
+}
+
+#[derive(Default)]
+struct RegistryRenames {
+    blocks: BTreeMap<String, String>,
+    structs: BTreeMap<String, String>,
+    arrays: BTreeMap<String, String>,
+    enums_flags: BTreeMap<String, String>,
+    datas: BTreeMap<String, String>,
+    resources: BTreeMap<String, String>,
+    interops: BTreeMap<String, String>,
+}
+
+impl RegistryRenames {
+    fn lookup(&self, registry: DefinitionRegistry, name: &str) -> Option<&String> {
+        match registry {
+            DefinitionRegistry::Blocks => self.blocks.get(name),
+            DefinitionRegistry::Structs => self.structs.get(name),
+            DefinitionRegistry::Arrays => self.arrays.get(name),
+            DefinitionRegistry::EnumsFlags => self.enums_flags.get(name),
+            DefinitionRegistry::Datas => self.datas.get(name),
+            DefinitionRegistry::Resources => self.resources.get(name),
+            DefinitionRegistry::Interops => self.interops.get(name),
         }
-        for (k, v) in parent_schema.arrays {
-            schema.arrays.entry(k).or_insert(v);
+    }
+
+    fn apply(&self, field: &mut TagFieldSchema) {
+        let Some(registry) = definition_registry(&field.ty) else { return };
+        let Some(name) = field.definition.as_str() else { return };
+        if let Some(renamed) = self.lookup(registry, name) {
+            field.definition = serde_json::Value::String(renamed.clone());
         }
-        for (k, v) in parent_schema.enums_flags {
-            schema.enums_flags.entry(k).or_insert(v);
+    }
+}
+
+/// Import `donor`'s registries on behalf of template `suffix`.
+///
+/// An entry whose name is free, or already present and identical, needs no
+/// special handling. One whose name is taken by something *different* is
+/// imported under a distinct key, and every reference within the donor is
+/// repointed at it.
+///
+/// That case is real, not defensive: `particle.json` declares
+/// `runtime_queryable_properties` with 12 elements for its own
+/// `material_postprocess_block`, and `render_method.json` declares 28 for
+/// `render_method_postprocess_block`. Both are reachable, so neither can be
+/// allowed to win — letting `particle`'s stand made the imported struct compute
+/// 140 bytes against a declared 172.
+fn import_template_registries(
+    schema: &mut TagSchema,
+    mut donor: TagSchema,
+    suffix: &str,
+) -> RegistryRenames {
+    let mut renames = RegistryRenames::default();
+
+    macro_rules! plan_renames {
+        ($registry:ident) => {
+            for (key, value) in donor.$registry.iter() {
+                if schema
+                    .$registry
+                    .get(key)
+                    .is_some_and(|existing| existing != value)
+                {
+                    renames
+                        .$registry
+                        .insert(key.clone(), format!("{key}{TEMPLATE_KEY_SUFFIX}{suffix}"));
+                }
+            }
+        };
+    }
+    plan_renames!(blocks);
+    plan_renames!(structs);
+    plan_renames!(arrays);
+    plan_renames!(enums_flags);
+    plan_renames!(datas);
+    plan_renames!(resources);
+    plan_renames!(interops);
+
+    for entry in donor.structs.values_mut() {
+        for field in entry.fields.iter_mut() {
+            renames.apply(field);
         }
-        for (k, v) in parent_schema.datas {
-            schema.datas.entry(k).or_insert(v);
+    }
+    for entry in donor.blocks.values_mut() {
+        if let Some(renamed) = renames.structs.get(&entry.struct_name) {
+            entry.struct_name = renamed.clone();
         }
-        for (k, v) in parent_schema.resources {
-            schema.resources.entry(k).or_insert(v);
+    }
+    for entry in donor.arrays.values_mut() {
+        if let Some(renamed) = renames.structs.get(&entry.struct_name) {
+            entry.struct_name = renamed.clone();
         }
-        for (k, v) in parent_schema.interops {
-            schema.interops.entry(k).or_insert(v);
+    }
+
+    macro_rules! commit {
+        ($registry:ident) => {
+            for (key, value) in std::mem::take(&mut donor.$registry) {
+                let key = renames.$registry.get(&key).cloned().unwrap_or(key);
+                schema.$registry.entry(key).or_insert(value);
+            }
+        };
+    }
+    commit!(blocks);
+    commit!(structs);
+    commit!(arrays);
+    commit!(enums_flags);
+    commit!(datas);
+    commit!(resources);
+    commit!(interops);
+
+    renames
+}
+
+/// Give a `tmpl` custom's sibling struct the fields it inherits.
+///
+/// A `custom` field tagged `tmpl` stands in for another group's inlined render
+/// method, and the `struct` field beside it points at that template group's own
+/// root struct — which *this* file declares carrying only the fields the
+/// template adds. What the template inherits through its own `parent_tag` chain
+/// lives in the ancestor JSONs, and [`merge_parent_schemas`] never reaches it,
+/// because here the struct is embedded rather than being the file's root.
+///
+/// Measured against a `particle` the Halo 4 editing kit authored itself
+/// (ManagedBlam's `TagFile.New` + `Save`): the kit writes
+/// `shader_particle_struct_definition` as 152 B / 20 fields — the 100 B / 14
+/// fields of `render_method_struct_definition` followed by the six that
+/// `particle.json` declares. We wrote the six alone. **Four of the fourteen are
+/// blocks**, so the tag was short four sub-chunks and the kit's own reader
+/// refused it with `invalid chunk tag ('' should be 'tgst')`, while this
+/// library — checking the file against its own arithmetic — saw nothing wrong.
+///
+/// Those bytes were already accounted for, as an anonymous hole in the
+/// *enclosing* struct. They move in here, so the enclosing struct keeps its
+/// size; the returned set tells the caller which holes to stop widening.
+///
+/// Deliberately conservative. A struct is only rewritten when it is genuinely
+/// truncated relative to the template that owns it *and* the sizes add up
+/// exactly, so a file that already declares the full form (`shader_particle`
+/// itself) or one whose embedded copy is already complete (`material_struct`,
+/// identical in all seven files that declare it) is left alone.
+fn merge_template_struct_inheritance(
+    schema: &mut TagSchema,
+    defs_dir: &Path,
+) -> std::collections::BTreeSet<String> {
+    let mut folded = std::collections::BTreeSet::new();
+    let Ok(meta_bytes) = std::fs::read(defs_dir.join("_meta.json")) else { return folded };
+    let Ok(meta): Result<serde_json::Value, _> = serde_json::from_slice(&meta_bytes) else {
+        return folded;
+    };
+    let Some(tag_index) = meta.get("tag_index").and_then(|v| v.as_object()) else {
+        return folded;
+    };
+
+    let targets: std::collections::BTreeSet<String> = schema
+        .structs
+        .values()
+        .flat_map(|entry| entry.fields.iter())
+        .filter(|field| field.ty == "custom" && field.group_tag.as_deref() == Some("tmpl"))
+        .filter_map(|field| field.definition.as_str().map(str::to_owned))
+        .collect();
+
+    for target in targets {
+        let Some(owner) = load_sibling_schema(defs_dir, tag_index, &target) else { continue };
+        let Some(owner_block) = owner.blocks.get(&owner.block) else { continue };
+        let root_name = owner_block.struct_name.clone();
+        let Some(owner_root) = owner.structs.get(&root_name) else { continue };
+        let owner_size = owner_root.size;
+
+        // Only a copy that is *short* of what the template's own file declares.
+        let Some(local) = schema.structs.get(&root_name) else { continue };
+        let local_size = local.size;
+        if local_size >= owner_size {
+            continue;
         }
 
-        current_parent = parent_schema.parent_tag;
+        // The template's ancestors, base class first.
+        let mut chain = Vec::new();
+        let mut current = owner.parent_tag.clone();
+        for _ in 0..32 {
+            let Some(tag) = current.take() else { break };
+            let Some(ancestor) = load_sibling_schema(defs_dir, tag_index, &tag) else { break };
+            current = ancestor.parent_tag.clone();
+            chain.push(ancestor);
+        }
+        chain.reverse();
+
+        // Check the arithmetic before importing anything, so a chain that does
+        // not reconcile leaves the schema exactly as the dump wrote it.
+        let mut inherited_size: u32 = 0;
+        let mut resolved = !chain.is_empty();
+        for ancestor in &chain {
+            let Some(block) = ancestor.blocks.get(&ancestor.block) else {
+                resolved = false;
+                break;
+            };
+            let Some(root) = ancestor.structs.get(&block.struct_name) else {
+                resolved = false;
+                break;
+            };
+            inherited_size = inherited_size.saturating_add(root.size);
+        }
+        // If the two declarations do not reconcile exactly, this is not the
+        // truncation this fix is for, and guessing would be worse than leaving
+        // it alone.
+        if !resolved || inherited_size == 0 || local_size + inherited_size != owner_size {
+            continue;
+        }
+
+        // The inherited fields name blocks, enums and structs that live in the
+        // ancestors' files; without those entries they cannot be emitted.
+        let mut ancestor_roots = Vec::new();
+        for ancestor in chain {
+            let root_key = ancestor
+                .blocks
+                .get(&ancestor.block)
+                .map(|block| block.struct_name.clone());
+            let renames = import_template_registries(schema, ancestor, &target);
+            if let Some(key) = root_key {
+                ancestor_roots
+                    .push(renames.structs.get(&key).cloned().unwrap_or(key));
+            }
+        }
+
+        // Read the fields back out of the imported copies, so they carry any
+        // repointing the import had to do.
+        let mut inherited: Vec<TagFieldSchema> = Vec::new();
+        for key in ancestor_roots {
+            let Some(root) = schema.structs.get(&key) else { continue };
+            inherited.extend(root.fields.iter().filter(|f| f.ty != "terminator").cloned());
+        }
+        if inherited.is_empty() {
+            continue;
+        }
+
+        let local = schema
+            .structs
+            .get_mut(&root_name)
+            .expect("checked present above");
+        let mut own = std::mem::take(&mut local.fields);
+        inherited.append(&mut own);
+        local.fields = inherited;
+        local.size = owner_size;
+        folded.insert(target);
     }
+    folded
 }
 
 /// Walk a `tmpl` target's parent chain and return the cumulative
@@ -510,6 +820,7 @@ fn tmpl_expansion_size(defs_dir: &Path, target_tag: &str) -> u32 {
 fn build_layout_from_schema(
     schema: TagSchema,
     defs_dir: &Path,
+    folded_templates: &std::collections::BTreeSet<String>,
 ) -> Result<TagLayout, TagSchemaError> {
     let _ = parse_group_tag(&schema.tag)?; // validate early
 
@@ -546,7 +857,7 @@ fn build_layout_from_schema(
     let data_definition_name_offsets: Vec<u32> = schema
         .datas
         .keys()
-        .map(|n| strings.intern(n))
+        .map(|n| strings.intern(schema_display_name(n)))
         .collect();
 
     // Build string_lists (enums/flags). Each enum's options go into
@@ -555,7 +866,7 @@ fn build_layout_from_schema(
     let mut string_offsets: Vec<u32> = Vec::new();
     let mut string_lists: Vec<TagStringList> = Vec::new();
     for (name, enum_schema) in &schema.enums_flags {
-        let list_name_offset = strings.intern(name);
+        let list_name_offset = strings.intern(schema_display_name(name));
         let first = string_offsets.len() as u32;
         for opt in &enum_schema.options {
             let off = match opt {
@@ -583,7 +894,7 @@ fn build_layout_from_schema(
     let mut array_layouts: Vec<TagArrayLayout> = Vec::with_capacity(schema.arrays.len());
     for (name, array) in &schema.arrays {
         array_layouts.push(TagArrayLayout {
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(schema_display_name(name)),
             count: array.count,
             struct_index: resolve_struct_name(&array.struct_name)?,
         });
@@ -593,7 +904,7 @@ fn build_layout_from_schema(
     let mut resource_layouts: Vec<TagResourceLayout> = Vec::with_capacity(schema.resources.len());
     for (name, resource) in &schema.resources {
         resource_layouts.push(TagResourceLayout {
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(schema_display_name(name)),
             unknown: resource.flags as u32,
             struct_index: resolve_struct_name(&resource.struct_name)?,
         });
@@ -603,7 +914,7 @@ fn build_layout_from_schema(
     let mut interop_layouts: Vec<TagInteropLayout> = Vec::with_capacity(schema.interops.len());
     for (name, interop) in &schema.interops {
         interop_layouts.push(TagInteropLayout {
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(schema_display_name(name)),
             struct_index: resolve_struct_name(&interop.struct_name)?,
             guid: parse_guid(&interop.guid)?,
         });
@@ -614,7 +925,7 @@ fn build_layout_from_schema(
     for (i, (name, block)) in schema.blocks.iter().enumerate() {
         block_layouts.push(TagBlockLayout {
             index: i as u32,
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(schema_display_name(name)),
             max_count: block.max_count,
             struct_index: resolve_struct_name(&block.struct_name)?,
         });
@@ -695,7 +1006,7 @@ fn build_layout_from_schema(
         struct_layouts.push(TagStructLayout {
             index: i as u32,
             guid: parse_guid(&struct_schema.guid)?,
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(schema_display_name(name)),
             first_field_index: first,
             size: 0, // computed later
             version: 0,
@@ -812,7 +1123,14 @@ fn build_layout_from_schema(
                 if field.ty == "custom"
                     && field.group_tag.as_deref() == Some("tmpl")
                     && let Some(target) = field.definition.as_str() {
-                        let exp = tmpl_expansion_size(defs_dir, target);
+                        // A template whose inherited fields now live in the
+                        // sibling struct must not also be reserved here, or the
+                        // enclosing struct pays for the same bytes twice.
+                        let exp = if folded_templates.contains(target) {
+                            0
+                        } else {
+                            tmpl_expansion_size(defs_dir, target)
+                        };
                         // A template whose tag is unparseable is not recorded
                         // rather than recorded as zero: an unknown identity and
                         // a known-empty one are different claims.

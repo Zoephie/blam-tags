@@ -205,21 +205,35 @@ fn a_tmpl_hole_records_which_template_fills_it() {
             .collect::<Vec<_>>()
     };
 
+    // Halo 3 declares `shader_particle_struct_definition` at its full width, so
+    // the hole keeps its bytes and nothing is folded.
     assert_eq!(holes("halo3_mcc", "particle"), vec![("?rmp".to_owned(), 64)]);
-    assert_eq!(holes("haloreach_mcc", "particle"), vec![("?rmp".to_owned(), 100)]);
+    // Reach declares the same struct short — 52 bytes of delta against the 152
+    // its own shipped tags carry — so the 100 inherited bytes move *into* that
+    // struct and the hole is left empty. Measured: 398 of 400 HREK particles
+    // put `actual shader?` at 152 bytes, and so do we now.
+    assert_eq!(holes("haloreach_mcc", "particle"), vec![("?rmp".to_owned(), 0)]);
     // Each fx group has its own render-method template, so the identity really
-    // does distinguish them rather than being one constant wearing three hats.
-    assert_eq!(holes("haloreach_mcc", "beam_system"), vec![("rmb".to_owned(), 100)]);
-    assert_eq!(holes("haloreach_mcc", "decal_system"), vec![("rmd".to_owned(), 100)]);
+    // does distinguish them rather than being one constant wearing three hats —
+    // and it survives the fold, which is the whole point of recording identity
+    // separately from width. All of Reach's fx groups declare their template's
+    // root struct short, so all of them fold.
+    assert_eq!(holes("haloreach_mcc", "beam_system"), vec![("rmb".to_owned(), 0)]);
+    assert_eq!(holes("haloreach_mcc", "decal_system"), vec![("rmd".to_owned(), 0)]);
 }
 
 /// A template that expands to nothing is still recorded.
 ///
-/// Halo 4's `particle` carries two holes: `mat` at zero bytes and `?rmp` at 100.
-/// A zero-width hole occupies no space and so cannot be found by arithmetic, but
-/// it names a template, and "no such template" and "a template with no inherited
-/// body" are different claims. Recording only the non-zero ones would have made
-/// them indistinguishable.
+/// Halo 4's `particle` carries two holes and both are now zero-width, for two
+/// different reasons: `mat` inherits nothing, and `?rmp`'s 100 bytes have moved
+/// into `shader_particle_struct_definition` where the editing kit puts them. A
+/// zero-width hole cannot be found by arithmetic, but it names a template, and
+/// "no such template" and "a template whose body lives in the sibling struct"
+/// are different claims — recording only the non-zero ones would erase both.
+///
+/// The kit is the authority here, not this arithmetic: a `particle` created by
+/// ManagedBlam's own `TagFile.New` writes `actual shader?` as 152 bytes over 20
+/// fields, and this build now matches it field for field.
 #[test]
 fn a_zero_width_template_hole_is_still_named() {
     let path = definitions().join("halo4_mcc/particle.json");
@@ -229,7 +243,36 @@ fn a_zero_width_template_hole_is_still_named() {
         .iter()
         .map(|hole| (blam_tags::format_group_tag(hole.group_tag), hole.size))
         .collect::<Vec<_>>();
-    assert_eq!(named, vec![("mat".to_owned(), 0), ("?rmp".to_owned(), 100)]);
+    assert_eq!(named, vec![("mat".to_owned(), 0), ("?rmp".to_owned(), 0)]);
+}
+
+/// The bytes a fold moves are not lost, and the struct they land in is the one
+/// the editing kit puts them in.
+///
+/// This is the assertion that would have caught the defect: before the fold,
+/// Halo 4's `shader_particle_struct_definition` built at 52 bytes over 6 fields
+/// while every shipped and kit-authored Halo 4 particle carries 152 over 20.
+/// Four of the missing fourteen are blocks, so the tag was short four
+/// sub-chunks and Foundation refused to open it — while this library, checking
+/// the file only against its own arithmetic, saw nothing wrong.
+#[test]
+fn a_folded_template_lands_in_the_sibling_struct() {
+    for game in ["halo4_mcc", "haloreach_mcc", "halo2amp_mcc"] {
+        let path = definitions().join(game).join("particle.json");
+        let Ok(layout) = blam_tags::TagLayout::from_json(&path) else {
+            continue;
+        };
+        let shader = layout
+            .struct_layouts
+            .iter()
+            .find(|s| layout.get_string(s.name_offset) == Some("shader_particle_struct_definition"))
+            .unwrap_or_else(|| panic!("{game}: no shader_particle_struct_definition"));
+        assert_eq!(
+            shader.size, 152,
+            "{game}: the render method's 100 inherited bytes should sit in \
+             shader_particle_struct_definition beside its own 52"
+        );
+    }
 }
 
 /// A layout parsed from a shipped tag's own `blay` has no template metadata.
