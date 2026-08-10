@@ -27,9 +27,23 @@
 //!   to pick a kit tag whose root size matches the declared size first, and
 //!   until it does the particle numbers here mean nothing.
 //!
-//! Its other limit: a freshly built tag has empty blocks, so only structs are
-//! descended into. Block element shapes are unmeasured, and for `effect` that is
-//! where the substance lives.
+//! **What this has now ruled out, and what it has not.** `cheap_particle_emitter`
+//! still crashes the official tools with every one of these agreeing: field
+//! list, field names, field types, struct sizes, struct names, struct GUIDs and
+//! struct versions. The kits read tags through `ManagedBlam.dll`, and a managed
+//! interface resolves a struct by its identity - which is now identical. So the
+//! root struct tree is exhausted as an explanation.
+//!
+//! What this comparison structurally cannot see, and where the next look must
+//! go: a freshly built tag has **empty blocks**, so it never descends into a
+//! block element. Nothing here compares block layouts (their `max_count`, their
+//! element struct), the `field_types` table, the string tables, the resource or
+//! interop layouts, or the tag body's chunk structure.
+//!
+//! The decisive experiment is available and cheap, because both outputs come
+//! from this pipeline and one of them is known to work: convert the same source
+//! tag twice - once with a populated kit, once with `BLAM_BUILD_FROM_DEFINITIONS`
+//! - and diff the two files chunk by chunk. Whatever differs is the answer.
 
 use blam_tags::convert::clean_field_key;
 use blam_tags::{TagFile, TagStruct};
@@ -81,6 +95,29 @@ fn shape(value: TagStruct<'_>) -> Vec<(String, String)> {
 fn compare(ours: TagStruct<'_>, theirs: TagStruct<'_>, path: &str, out: &mut Vec<String>) {
     let a = shape(ours);
     let b = shape(theirs);
+    // ManagedBlam is what the editing kits read tags through, and a managed
+    // interface resolves a struct by its identity rather than by its position.
+    if ours.definition().guid() != theirs.definition().guid() {
+        out.push(format!(
+            "{path}: GUID ours {:02x?} kit {:02x?}",
+            &ours.definition().guid()[..4],
+            &theirs.definition().guid()[..4]
+        ));
+    }
+    if ours.definition().name() != theirs.definition().name() {
+        out.push(format!(
+            "{path}: struct name ours {:?} kit {:?}",
+            ours.definition().name(),
+            theirs.definition().name()
+        ));
+    }
+    if ours.definition().version() != theirs.definition().version() {
+        out.push(format!(
+            "{path}: struct version ours {} kit {}",
+            ours.definition().version(),
+            theirs.definition().version()
+        ));
+    }
     if ours.definition().size() != theirs.definition().size() || a.len() != b.len() {
         out.push(format!(
             "{path}: ours {}B/{} fields, kit {}B/{} fields",
