@@ -83,11 +83,27 @@ use crate::{TagFieldData, TagFile};
 pub const JMS_TO_WORLD: f32 = 0.01;
 /// The minimum width the compression bounds are widened to.
 pub const MIN_BOUND_WIDTH: f32 = 0.01;
-/// `tool.exe`'s per-section vertex limit. The format allows 65,535, but
-/// the index budget binds near 37,000 for typical geometry anyway.
-pub const MAX_VERTICES_PER_MESH: usize = 32_767;
+/// The per-mesh vertex ceiling.
+///
+/// 65,535, which is what the format allows: `raw_vertex_block`'s
+/// `max_count` is `UNSIGNED_SHORT_MAX`. The 32,767 this used to sit at
+/// is `SHORT_MAX`, and that cap belongs to `subpart_block` rather than
+/// to vertices — half the real ceiling, refusing models the format
+/// holds perfectly well.
+///
+/// An index may then reach 65,534. `0xFFFF` stays out of reach as the
+/// strip-restart sentinel, which is exactly where the packer draws its
+/// own line.
+pub const MAX_VERTICES_PER_MESH: usize = 65_535;
 /// A mesh gets at most this many indices.
 pub const MAX_INDICES_PER_MESH: usize = 65_535;
+/// The most indices one part may name.
+///
+/// `index count` is a `short_integer`. Past 32,767 it writes negative,
+/// and a reader that treats a non-positive count as an empty range drops
+/// the run without a word — the same silent loss that cost a mesh on the
+/// structure side. Even, so a strip chunk keeps its winding parity.
+const MAX_INDICES_PER_PART: usize = 32_766;
 
 /// How to interpret the JMS.
 #[derive(Debug, Clone)]
@@ -912,7 +928,24 @@ fn write_mesh(
         let real_start = indices.len();
         indices.extend_from_slice(&run);
         let _ = start;
-        parts.push((*material, real_start, indices.len() - real_start));
+        // One part per chunk of the run, so `index count` stays inside a
+        // signed word. The chunks overlap by two indices and begin at an
+        // even offset: a strip's triangle `i` is `(i, i+1, i+2)` with its
+        // winding flipped on odd `i`, so an even start keeps the parity
+        // and the overlap keeps the two triangles that span the join.
+        let len = indices.len() - real_start;
+        let mut at = 0usize;
+        while at < len {
+            let take = (len - at).min(MAX_INDICES_PER_PART);
+            parts.push((*material, real_start + at, take));
+            if at + take >= len {
+                break;
+            }
+            at += take - 2;
+            if at % 2 != 0 {
+                at -= 1;
+            }
+        }
     }
 
     if indices.len() > MAX_INDICES_PER_MESH {
